@@ -1,0 +1,27 @@
+# Loki .gitignore
+
+# Ignore Loki's own repo data
+.loki/
+
+# Ignore build output
+loki
+*.exe
+*.out
+*.o
+
+# Explicitly allow cmd/ and its contents
+!cmd/
+!cmd/loki/
+!cmd/loki/main.go
+
+# Ignore Go build cache and modules
+bin/
+obj/
+*.test
+
+# Ignore editor/project files
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
