@@ -10,7 +10,11 @@ func Status() {
 	files := repo.Status()
 
 	fmt.Println("Staged files:")
+	if( len(files) == 0 ) {
+		fmt.Println("nothing to commit")
+		return;
+	}
 	for _, f := range files {
 		fmt.Println(" ", f)
-	}
+		}
 }
