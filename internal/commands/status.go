@@ -8,11 +8,18 @@ import (
 func Status() {
 	repo := core.OpenRepository()
 	files := repo.Status()
-	if( len(files) == 0 ) {
-		fmt.Println("No files staged to commit")
-		return;
-	}
-	fmt.Println("Staged files:")
+ master
+fmt.Println("Changes to be committed:")
+
+if len(files) == 0 {
+    fmt.Println("  (no files staged)")
+    return
+}
+
+for _, f := range files {
+    fmt.Println("  ", f)
+}
+ master
 	for _, f := range files {
 		fmt.Println(" ", f)
 		}
