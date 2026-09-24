@@ -15,6 +15,7 @@ A minimal, educational Git-style version control system written in Go. Loki demo
 - **User credential support**: Set and store user identity for commits
 - **Colored CLI output**: All CLI outputs use colored text for better readability
 - **Repository guard**: Commands cannot run when repository is not initialized
+- **tag**: Create, list, or delete lightweight and annotated tags
 - **CI workflow**: Automated CI pipeline included
 - Real object storage: blobs, trees, and commits (Git-style)
 
@@ -147,6 +148,14 @@ Initialized empty Loki repository at /home/user/myproject/.loki
 ./loki status
 # View commit log
 ./loki log
+# Create a lightweight tag
+./loki tag v1.0
+# Create an annotated tag
+./loki tag -a v1.0.0 -m "Release 1.0.0"
+# List tags
+./loki tag
+# Delete a tag
+./loki tag -d v1.0
 ```
 
 ---

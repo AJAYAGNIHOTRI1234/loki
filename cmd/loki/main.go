@@ -60,6 +60,8 @@ func main() {
 		commands.Help()
 	case "config":
 		commands.Config(os.Args[2:])
+	case "tag":
+		commands.Tag(os.Args[2:])
 	default:
 		fmt.Println("Unknown command:", os.Args[1])
 		commands.Help()

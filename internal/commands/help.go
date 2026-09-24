@@ -12,5 +12,6 @@ func Help() {
                       - -m <msg>    Commit message
  	merge             Merge a branch into the current branch
   status            Show the working tree status
-  log               Show commit logs`)
+  log               Show commit logs
+  tag               Create, list, or delete tags`)
 }

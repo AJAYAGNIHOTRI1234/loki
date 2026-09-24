@@ -13,6 +13,7 @@ func Init() {
 		".loki/objects",
 		".loki/refs",
 		".loki/refs/heads",
+		".loki/refs/tags",
 	}
 
 	for _, d := range dirs {

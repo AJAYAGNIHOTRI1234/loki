@@ -653,6 +653,18 @@ func (r *Repository) resolveBranchCommitHash(branch string) (string, error) {
 	refPath := filepath.Join(".loki", "refs", "heads", branch)
 	if _, err := os.Stat(refPath); err != nil {
 		if os.IsNotExist(err) {
+			tagPath := filepath.Join(".loki", "refs", "tags", branch)
+			if tagHashData, err := os.ReadFile(tagPath); err == nil {
+				refHash := strings.TrimSpace(string(tagHashData))
+				if objData, err := r.store.ReadObject(refHash); err == nil && bytes.HasPrefix(objData, []byte("tag ")) {
+					if tagObj, err := models.ParseTag(objData); err == nil && tagObj.Object != "" {
+						return tagObj.Object, nil
+					}
+				}
+				if refHash != "" {
+					return refHash, nil
+				}
+			}
 			return "", fmt.Errorf("branch %s not found", branch)
 		}
 		return "", fmt.Errorf("failed to read branch %s: %v", branch, err)
@@ -1052,6 +1064,26 @@ func (r *Repository) resolveCheckoutTarget(target string) (string, string, error
 			return "", "", fmt.Errorf("branch %s has no commit", target)
 		}
 		return commitHash, "ref: refs/heads/" + target, nil
+	}
+
+	tagPath := filepath.Join(".loki", "refs", "tags", target)
+	if _, err := os.Stat(tagPath); err == nil {
+		hashData, err := os.ReadFile(tagPath)
+		if err != nil {
+			return "", "", fmt.Errorf("failed to read tag file: %v", err)
+		}
+		refHash := strings.TrimSpace(string(hashData))
+		if refHash == "" {
+			return "", "", fmt.Errorf("tag %s has no commit", target)
+		}
+		objData, err := r.store.ReadObject(refHash)
+		if err == nil && bytes.HasPrefix(objData, []byte("tag ")) {
+			tagObj, err := models.ParseTag(objData)
+			if err == nil && tagObj.Object != "" {
+				return tagObj.Object, tagObj.Object, nil
+			}
+		}
+		return refHash, refHash, nil
 	}
 
 	return target, target, nil
