@@ -48,6 +48,8 @@ func main() {
 		commands.Log()
 	case "branch":
 		commands.Branch(os.Args[2:])
+	case "merge":
+		commands.Merge(os.Args[2:])
 	case "checkout":
 		commands.Checkout(os.Args[2:])
 	case "rm":

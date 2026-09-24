@@ -9,6 +9,7 @@ A minimal, educational Git-style version control system written in Go. Loki demo
 - **init**: Initialize a new Loki repository (displays current path on init)
 - **add \<files\>**: Stage files for commit with multi-file support; errors on missing files, success confirmation for present files
 - **commit -m "message"**: Commit staged files
+- **merge**: Merge another branch into the current branch, including fast-forward and 3-way merge cases
 - **status**: Show staged files and changes to be committed; handles empty index gracefully
 - **log**: Show commit log with full output after each commit
 - **User credential support**: Set and store user identity for commits
@@ -127,6 +128,11 @@ Initialized empty Loki repository at /home/user/myproject/.loki
 ### `loki commit -m "message"`
 - Requires user credentials to be set before committing
 - Attaches author identity to each commit
+
+### `loki merge <branch>`
+- Fast-forwards when the target branch is ahead of the current branch
+- Performs a 3-way merge when branches diverge
+- Writes conflict markers and leaves the merge for resolution when the same file is changed differently
 
 ---
 
