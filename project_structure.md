@@ -11,6 +11,7 @@ loki/
 │   │   ├── commit.go              # loki commit -m "message"
 │   │   ├── status.go              # loki status
 │   │   ├── log.go                 # loki log
+│   │   ├── tag.go                 # loki tag (create, list, delete tags)
 │   │   └── help.go                # loki help
 │   │
 │   ├── core/                      # Core repository logic
@@ -22,7 +23,8 @@ loki/
 │   │   ├── types.go               # ObjectType enum
 │   │   ├── blob.go                # Blob struct & methods
 │   │   ├── tree.go                # Tree struct & methods
-│   │   └── commit.go              # Commit struct & methods
+│   │   ├── commit.go              # Commit struct & methods
+│   │   └── tag.go                 # Tag struct & methods
 │   │
 │   └── storage/                   # Storage abstraction layer
 │       ├── storage.go             # Storage interface + FileStorage impl
