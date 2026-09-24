@@ -219,10 +219,26 @@ func (r *Repository) GetIndexEntries() map[string]string {
 func (r *Repository) Commit(message, author, email string) string {
 	// Write the tree and get its hash
 	treeHash := r.index.WriteTree(r.store)
+	parents := []string{}
+	if headCommit, err := r.resolveHeadCommitHash(); err == nil && headCommit != "" {
+		parents = append(parents, headCommit)
+	}
+	if mergeHead, err := r.readMergeHead(); err == nil && mergeHead != "" {
+		if err := r.ensureIndexMatchesWorkingTree(); err != nil {
+			fmt.Println(utils.ColorText("error: "+err.Error(), "error"))
+			return ""
+		}
+		if len(parents) == 0 {
+			parents = []string{mergeHead}
+		} else if parents[0] != mergeHead {
+			parents = append(parents, mergeHead)
+		}
+	}
 
 	// Create a proper Commit object using the model
 	commitModel := &models.Commit{
 		Tree:    treeHash,
+		Parents: parents,
 		Message: message,
 		Author:  author,
 		Email:   email,
@@ -248,6 +264,7 @@ func (r *Repository) Commit(message, author, email string) string {
 			os.WriteFile(".loki/HEAD", []byte(commitHash+"\n"), 0644)
 		}
 	}
+	_ = r.clearMergeState()
 
 	return commitHash
 }
@@ -358,54 +375,13 @@ func (r *Repository) Checkout(target string) error {
 		return err
 	}
 
-	treeHash, err := r.commitTreeHash(commitHash)
-	if err != nil {
-		return err
-	}
-
 	if err := r.ensureCleanForCheckout(); err != nil {
 		return err
 	}
 
-	currentTracked := map[string]string{}
-	if headCommit, err := r.resolveHeadCommitHash(); err == nil && headCommit != "" {
-		if headTreeHash, err := r.commitTreeHash(headCommit); err == nil && headTreeHash != "" {
-			if err := r.collectTreeFiles(headTreeHash, "", currentTracked); err != nil {
-				return err
-			}
-		}
-	}
-
-	for path := range currentTracked {
-		if strings.HasPrefix(path, ".loki/") || path == ".loki" {
-			continue
-		}
-		_ = os.Remove(filepath.FromSlash(path))
-	}
-
-	targetFiles := map[string]string{}
-	if err := r.collectTreeFiles(treeHash, "", targetFiles); err != nil {
+	if err := r.applyCommitToWorkingTree(commitHash); err != nil {
 		return err
 	}
-
-	r.index.Entries = make(map[string]string)
-	for path, blobHash := range targetFiles {
-		blobData, err := r.store.ReadObject(blobHash)
-		if err != nil {
-			return fmt.Errorf("failed to read blob %s: %v", blobHash, err)
-		}
-		content := objectBody(blobData)
-
-		osPath := filepath.FromSlash(path)
-		if err := os.MkdirAll(filepath.Dir(osPath), 0755); err != nil {
-			return fmt.Errorf("failed to create directory for %s: %v", path, err)
-		}
-		if err := os.WriteFile(osPath, content, 0644); err != nil {
-			return fmt.Errorf("failed to write file %s: %v", path, err)
-		}
-		r.index.Add(path, blobHash)
-	}
-	r.index.Save()
 
 	if err := os.WriteFile(".loki/HEAD", []byte(headContent+"\n"), 0644); err != nil {
 		return fmt.Errorf("failed to update HEAD: %v", err)
@@ -468,18 +444,600 @@ func (r *Repository) resolveHeadCommitHash() (string, error) {
 	return ref, nil
 }
 
-func (r *Repository) commitTreeHash(commitHash string) (string, error) {
+type commitData struct {
+	tree    string
+	parents []string
+}
+
+func (r *Repository) readCommitData(commitHash string) (*commitData, error) {
 	objData, err := r.store.ReadObject(commitHash)
 	if err != nil {
-		return "", fmt.Errorf("target commit %s not found", commitHash)
+		return nil, fmt.Errorf("target commit %s not found", commitHash)
 	}
 	body := objectBody(objData)
+	data := &commitData{parents: []string{}}
 	for _, line := range bytes.Split(body, []byte("\n")) {
 		if bytes.HasPrefix(line, []byte("tree ")) {
-			return strings.TrimSpace(string(line[5:])), nil
+			data.tree = strings.TrimSpace(string(line[5:]))
+			continue
+		}
+		if bytes.HasPrefix(line, []byte("parent ")) {
+			data.parents = append(data.parents, strings.TrimSpace(string(line[7:])))
 		}
 	}
-	return "", fmt.Errorf("commit %s has no tree", commitHash)
+	if data.tree == "" {
+		return nil, fmt.Errorf("commit %s has no tree", commitHash)
+	}
+	return data, nil
+}
+
+func (r *Repository) commitTreeHash(commitHash string) (string, error) {
+	data, err := r.readCommitData(commitHash)
+	if err != nil {
+		return "", err
+	}
+	return data.tree, nil
+}
+
+func (r *Repository) commitParents(commitHash string) ([]string, error) {
+	data, err := r.readCommitData(commitHash)
+	if err != nil {
+		return nil, err
+	}
+	parents := make([]string, 0, len(data.parents))
+	for _, parent := range data.parents {
+		if parent != "" {
+			parents = append(parents, parent)
+		}
+	}
+	return parents, nil
+}
+
+func (r *Repository) currentTrackedFiles() (map[string]string, error) {
+	tracked := map[string]string{}
+	headCommit, err := r.resolveHeadCommitHash()
+	if err != nil {
+		return nil, err
+	}
+	if headCommit == "" {
+		return tracked, nil
+	}
+	headTreeHash, err := r.commitTreeHash(headCommit)
+	if err != nil {
+		return nil, err
+	}
+	if err := r.collectTreeFiles(headTreeHash, "", tracked); err != nil {
+		return nil, err
+	}
+	return tracked, nil
+}
+
+func (r *Repository) readMergeHead() (string, error) {
+	data, err := os.ReadFile(".loki/MERGE_HEAD")
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	return strings.TrimSpace(string(data)), nil
+}
+
+func (r *Repository) readMergeConflicts() ([]string, error) {
+	data, err := os.ReadFile(".loki/MERGE_CONFLICTS")
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	conflicts := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			conflicts = append(conflicts, line)
+		}
+	}
+	return conflicts, nil
+}
+
+func (r *Repository) clearMergeState() error {
+	_ = os.Remove(".loki/MERGE_HEAD")
+	_ = os.Remove(".loki/MERGE_CONFLICTS")
+	return nil
+}
+
+func (r *Repository) ensureIndexMatchesWorkingTree() error {
+	for path, indexHash := range r.index.Entries {
+		content, err := os.ReadFile(filepath.FromSlash(path))
+		if err != nil {
+			return fmt.Errorf("working tree has unresolved changes for %s", path)
+		}
+		if blobHashForContent(content) != indexHash {
+			return fmt.Errorf("working tree has unresolved changes for %s", path)
+		}
+	}
+	return nil
+}
+
+func (r *Repository) replaceWorkingTreeWithFiles(target map[string]string) error {
+	currentTracked, err := r.currentTrackedFiles()
+	if err != nil {
+		return err
+	}
+
+	for path := range currentTracked {
+		if _, ok := target[path]; !ok {
+			_ = os.Remove(filepath.FromSlash(path))
+		}
+	}
+
+	r.index.Entries = make(map[string]string)
+	for path, blobHash := range target {
+		blobData, err := r.store.ReadObject(blobHash)
+		if err != nil {
+			return fmt.Errorf("failed to read blob %s: %v", blobHash, err)
+		}
+		content := objectBody(blobData)
+
+		osPath := filepath.FromSlash(path)
+		if err := os.MkdirAll(filepath.Dir(osPath), 0755); err != nil {
+			return fmt.Errorf("failed to create directory for %s: %v", path, err)
+		}
+		if err := os.WriteFile(osPath, content, 0644); err != nil {
+			return fmt.Errorf("failed to write file %s: %v", path, err)
+		}
+		r.index.Add(path, blobHash)
+	}
+	r.index.Save()
+
+	return nil
+}
+
+func (r *Repository) applyMergeResult(cleanFiles map[string]string, conflictMarkers map[string]string) error {
+	currentTracked, err := r.currentTrackedFiles()
+	if err != nil {
+		return err
+	}
+
+	newIndex := make(map[string]string, len(r.index.Entries))
+	for path, hash := range r.index.Entries {
+		newIndex[path] = hash
+	}
+
+	for path := range currentTracked {
+		if _, keep := cleanFiles[path]; keep {
+			continue
+		}
+		if _, conflicted := conflictMarkers[path]; conflicted {
+			continue
+		}
+		_ = os.Remove(filepath.FromSlash(path))
+		delete(newIndex, path)
+	}
+
+	for path, blobHash := range cleanFiles {
+		blobData, err := r.store.ReadObject(blobHash)
+		if err != nil {
+			return fmt.Errorf("failed to read blob %s: %v", blobHash, err)
+		}
+		content := objectBody(blobData)
+
+		osPath := filepath.FromSlash(path)
+		if err := os.MkdirAll(filepath.Dir(osPath), 0755); err != nil {
+			return fmt.Errorf("failed to create directory for %s: %v", path, err)
+		}
+		if err := os.WriteFile(osPath, content, 0644); err != nil {
+			return fmt.Errorf("failed to write file %s: %v", path, err)
+		}
+		newIndex[path] = blobHash
+	}
+
+	for path, content := range conflictMarkers {
+		osPath := filepath.FromSlash(path)
+		if err := os.MkdirAll(filepath.Dir(osPath), 0755); err != nil {
+			return fmt.Errorf("failed to create directory for %s: %v", path, err)
+		}
+		if err := os.WriteFile(osPath, []byte(content), 0644); err != nil {
+			return fmt.Errorf("failed to write file %s: %v", path, err)
+		}
+	}
+
+	r.index.Entries = newIndex
+	r.index.Save()
+	return nil
+}
+
+func (r *Repository) resolveBranchCommitHash(branch string) (string, error) {
+	refPath := filepath.Join(".loki", "refs", "heads", branch)
+	if _, err := os.Stat(refPath); err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("branch %s not found", branch)
+		}
+		return "", fmt.Errorf("failed to read branch %s: %v", branch, err)
+	}
+	hashData, err := os.ReadFile(refPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read branch %s: %v", branch, err)
+	}
+	commitHash := strings.TrimSpace(string(hashData))
+	if commitHash == "" {
+		return "", fmt.Errorf("branch %s has no commit", branch)
+	}
+	return commitHash, nil
+}
+
+func (r *Repository) isAncestor(ancestor, descendant string) (bool, error) {
+	if ancestor == "" {
+		return descendant == "", nil
+	}
+	if ancestor == descendant {
+		return true, nil
+	}
+	if descendant == "" {
+		return false, nil
+	}
+
+	visited := map[string]bool{}
+	queue := []string{descendant}
+	for len(queue) > 0 {
+		commitHash := queue[0]
+		queue = queue[1:]
+		if visited[commitHash] {
+			continue
+		}
+		visited[commitHash] = true
+		if commitHash == ancestor {
+			return true, nil
+		}
+		parents, err := r.commitParents(commitHash)
+		if err != nil {
+			return false, err
+		}
+		queue = append(queue, parents...)
+	}
+
+	return false, nil
+}
+
+func (r *Repository) ancestorDistances(start string) (map[string]int, error) {
+	distances := map[string]int{}
+	if start == "" {
+		return distances, nil
+	}
+
+	queue := []string{start}
+	distances[start] = 0
+
+	for len(queue) > 0 {
+		commitHash := queue[0]
+		queue = queue[1:]
+		parents, err := r.commitParents(commitHash)
+		if err != nil {
+			return nil, err
+		}
+		for _, parent := range parents {
+			if parent == "" {
+				continue
+			}
+			if _, ok := distances[parent]; ok {
+				continue
+			}
+			distances[parent] = distances[commitHash] + 1
+			queue = append(queue, parent)
+		}
+	}
+
+	return distances, nil
+}
+
+func (r *Repository) mergeBase(left, right string) (string, error) {
+	leftDistances, err := r.ancestorDistances(left)
+	if err != nil {
+		return "", err
+	}
+	if right == "" {
+		return "", fmt.Errorf("no common ancestor found")
+	}
+
+	type queueItem struct {
+		commit string
+		dist   int
+	}
+
+	bestCommit := ""
+	bestScore := int(^uint(0) >> 1)
+	visited := map[string]bool{}
+	queue := []queueItem{{commit: right, dist: 0}}
+
+	for len(queue) > 0 {
+		item := queue[0]
+		queue = queue[1:]
+		if visited[item.commit] {
+			continue
+		}
+		visited[item.commit] = true
+		if leftDist, ok := leftDistances[item.commit]; ok {
+			score := leftDist + item.dist
+			if score < bestScore {
+				bestScore = score
+				bestCommit = item.commit
+			}
+		}
+		parents, err := r.commitParents(item.commit)
+		if err != nil {
+			return "", err
+		}
+		for _, parent := range parents {
+			if parent == "" {
+				continue
+			}
+			queue = append(queue, queueItem{commit: parent, dist: item.dist + 1})
+		}
+	}
+
+	if bestCommit == "" {
+		return "", fmt.Errorf("no common ancestor found")
+	}
+	return bestCommit, nil
+}
+
+func (r *Repository) mergeTreeMaps(base, current, source map[string]string, branch string) (map[string]string, map[string]string, error) {
+	merged := map[string]string{}
+	conflicts := map[string]string{}
+	paths := map[string]struct{}{}
+	for path := range base {
+		paths[path] = struct{}{}
+	}
+	for path := range current {
+		paths[path] = struct{}{}
+	}
+	for path := range source {
+		paths[path] = struct{}{}
+	}
+
+	for path := range paths {
+		baseHash, baseOK := base[path]
+		currentHash, currentOK := current[path]
+		sourceHash, sourceOK := source[path]
+
+		switch {
+		case currentOK && sourceOK && currentHash == sourceHash:
+			merged[path] = currentHash
+		case !baseOK && currentOK && !sourceOK:
+			merged[path] = currentHash
+		case !baseOK && !currentOK && sourceOK:
+			merged[path] = sourceHash
+		case !baseOK && currentOK && sourceOK:
+			conflicts[path] = r.makeConflictMarker(path, currentHash, sourceHash, branch)
+		case baseOK && currentOK && !sourceOK:
+			if currentHash == baseHash {
+				continue
+			}
+			conflicts[path] = r.makeConflictMarker(path, currentHash, "", branch)
+		case baseOK && !currentOK && sourceOK:
+			if sourceHash == baseHash {
+				continue
+			}
+			conflicts[path] = r.makeConflictMarker(path, "", sourceHash, branch)
+		case baseOK && currentOK && sourceOK:
+			currentChanged := currentHash != baseHash
+			sourceChanged := sourceHash != baseHash
+			switch {
+			case !currentChanged && sourceChanged:
+				merged[path] = sourceHash
+			case currentChanged && !sourceChanged:
+				merged[path] = currentHash
+			case !currentChanged && !sourceChanged:
+				merged[path] = currentHash
+			case currentHash == sourceHash:
+				merged[path] = currentHash
+			default:
+				conflicts[path] = r.makeConflictMarker(path, currentHash, sourceHash, branch)
+			}
+		case baseOK && !currentOK && !sourceOK:
+			continue
+		case !baseOK && currentOK && !sourceOK:
+			merged[path] = currentHash
+		case !baseOK && !currentOK && sourceOK:
+			merged[path] = sourceHash
+		default:
+			continue
+		}
+	}
+
+	return merged, conflicts, nil
+}
+
+func (r *Repository) makeConflictMarker(path, currentHash, sourceHash, branch string) string {
+	currentContent := ""
+	sourceContent := ""
+	if currentHash != "" {
+		if content, err := r.ReadBlob(currentHash); err == nil {
+			currentContent = content
+		}
+	}
+	if sourceHash != "" {
+		if content, err := r.ReadBlob(sourceHash); err == nil {
+			sourceContent = content
+		}
+	}
+	return fmt.Sprintf("<<<<<<< HEAD\n%s=======\n%s>>>>>>> %s\n", currentContent, sourceContent, branch)
+}
+
+func (r *Repository) createCommit(message, author, email string, parents []string) string {
+	treeHash := r.index.WriteTree(r.store)
+	commitModel := &models.Commit{
+		Tree:    treeHash,
+		Parents: parents,
+		Message: message,
+		Author:  author,
+		Email:   email,
+	}
+
+	commitHash := r.store.WriteObject(commitModel.Serialize())
+	f, _ := os.OpenFile(filepath.Join(r.store.GiveRoot(), "commits.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	defer f.Close()
+	f.WriteString(commitHash + " " + message + " " + author + " <" + email + ">\n")
+
+	headData, err := os.ReadFile(".loki/HEAD")
+	if err == nil {
+		ref := string(bytes.TrimSpace(headData))
+		if len(ref) >= 5 && ref[:4] == "ref:" {
+			refPath := ".loki/" + ref[5:]
+			os.MkdirAll(filepath.Dir(refPath), 0755)
+			os.WriteFile(refPath, []byte(commitHash+"\n"), 0644)
+		} else {
+			os.WriteFile(".loki/HEAD", []byte(commitHash+"\n"), 0644)
+		}
+	}
+
+	_ = r.clearMergeState()
+
+	return commitHash
+}
+
+func (r *Repository) applyCommitToWorkingTree(commitHash string) error {
+	targetFiles, err := r.readCommitFileMap(commitHash)
+	if err != nil {
+		return err
+	}
+	return r.replaceWorkingTreeWithFiles(targetFiles)
+}
+
+func (r *Repository) readCommitFileMap(commitHash string) (map[string]string, error) {
+	treeHash, err := r.commitTreeHash(commitHash)
+	if err != nil {
+		return nil, err
+	}
+	targetFiles := map[string]string{}
+	if err := r.collectTreeFiles(treeHash, "", targetFiles); err != nil {
+		return nil, err
+	}
+	return targetFiles, nil
+}
+
+func (r *Repository) MergeFastForward(branch string) (string, error) {
+	sourceCommit, err := r.resolveBranchCommitHash(branch)
+	if err != nil {
+		return "", err
+	}
+
+	currentCommit, err := r.resolveHeadCommitHash()
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve HEAD: %v", err)
+	}
+
+	if currentCommit == sourceCommit {
+		return fmt.Sprintf("Already up to date with %s", branch), nil
+	}
+
+	isFastForward, err := r.isAncestor(currentCommit, sourceCommit)
+	if err != nil {
+		return "", err
+	}
+	if !isFastForward {
+		return "", fmt.Errorf("cannot fast-forward merge %s into current branch", branch)
+	}
+
+	if err := r.ensureCleanForCheckout(); err != nil {
+		return "", err
+	}
+
+	if err := r.applyCommitToWorkingTree(sourceCommit); err != nil {
+		return "", err
+	}
+
+	if err := r.updateHeadOrRef(sourceCommit); err != nil {
+		return "", fmt.Errorf("failed to update branch pointer: %v", err)
+	}
+
+	return fmt.Sprintf("Fast-forwarded current branch to %s", branch), nil
+}
+
+func (r *Repository) Merge(branch, author, email string) (string, error) {
+	sourceCommit, err := r.resolveBranchCommitHash(branch)
+	if err != nil {
+		return "", err
+	}
+
+	currentCommit, err := r.resolveHeadCommitHash()
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve HEAD: %v", err)
+	}
+
+	if currentCommit == sourceCommit {
+		return fmt.Sprintf("Already up to date with %s", branch), nil
+	}
+
+	isCurrentAncestor, err := r.isAncestor(currentCommit, sourceCommit)
+	if err != nil {
+		return "", err
+	}
+	if isCurrentAncestor {
+		return r.MergeFastForward(branch)
+	}
+
+	isSourceAncestor, err := r.isAncestor(sourceCommit, currentCommit)
+	if err != nil {
+		return "", err
+	}
+	if isSourceAncestor {
+		return fmt.Sprintf("Already up to date with %s", branch), nil
+	}
+
+	if err := r.ensureCleanForCheckout(); err != nil {
+		return "", err
+	}
+
+	baseCommit, err := r.mergeBase(currentCommit, sourceCommit)
+	if err != nil {
+		return "", err
+	}
+
+	baseFiles, err := r.readCommitFileMap(baseCommit)
+	if err != nil {
+		return "", err
+	}
+	currentFiles, err := r.readCommitFileMap(currentCommit)
+	if err != nil {
+		return "", err
+	}
+	sourceFiles, err := r.readCommitFileMap(sourceCommit)
+	if err != nil {
+		return "", err
+	}
+
+	mergedFiles, conflicts, err := r.mergeTreeMaps(baseFiles, currentFiles, sourceFiles, branch)
+	if err != nil {
+		return "", err
+	}
+
+	if len(conflicts) == 0 {
+		if err := r.replaceWorkingTreeWithFiles(mergedFiles); err != nil {
+			return "", err
+		}
+		parents := []string{currentCommit, sourceCommit}
+		_ = r.createCommit("Merge branch '"+branch+"'", author, email, parents)
+		return fmt.Sprintf("Merged %s into current branch", branch), nil
+	}
+
+	if err := r.applyMergeResult(mergedFiles, conflicts); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(".loki/MERGE_HEAD", []byte(sourceCommit+"\n"), 0644); err != nil {
+		return "", fmt.Errorf("failed to write merge state: %v", err)
+	}
+	conflictList := make([]string, 0, len(conflicts))
+	for path := range conflicts {
+		conflictList = append(conflictList, path)
+	}
+	if err := os.WriteFile(".loki/MERGE_CONFLICTS", []byte(strings.Join(conflictList, "\n")+"\n"), 0644); err != nil {
+		return "", fmt.Errorf("failed to write merge state: %v", err)
+	}
+
+	return "Automatic merge failed; fix conflicts and commit the result", nil
 }
 
 func (r *Repository) resolveCheckoutTarget(target string) (string, string, error) {
