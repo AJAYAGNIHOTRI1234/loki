@@ -1,4 +1,7 @@
-# Loki
+<div align="center">
+  <img src="public/assests/title.png" alt="Loki Title" width="400"/>
+</div>
+
 
 A minimal, educational Git-style version control system written in Go. Loki demonstrates the core ideas behind Git: object storage, staging, commits, and a simple CLI.
 
