@@ -56,6 +56,8 @@ func main() {
 		commands.Rm(os.Args[2:])
 	case "reset":
 		commands.Reset(os.Args[2:])
+	case "revert":
+		commands.Revert(os.Args[2:])
 	case "help":
 		commands.Help()
 	case "config":

@@ -265,8 +265,164 @@ func (r *Repository) Commit(message, author, email string) string {
 		}
 	}
 	_ = r.clearMergeState()
+	_ = r.clearRevertState()
 
 	return commitHash
+}
+
+func (r *Repository) Revert(commitHash, author, email string) (string, error) {
+	targetCommit, err := r.readCommitData(commitHash)
+	if err != nil {
+		return "", err
+	}
+
+	if len(targetCommit.parents) > 1 {
+		return "", fmt.Errorf("reverting merge commits is not supported")
+	}
+
+	parentFiles := map[string]string{}
+	if len(targetCommit.parents) == 1 {
+		parentFiles, err = r.readCommitFileMap(targetCommit.parents[0])
+		if err != nil {
+			return "", err
+		}
+	}
+
+	targetFiles, err := r.readCommitFileMap(commitHash)
+	if err != nil {
+		return "", err
+	}
+
+	currentFiles, err := r.currentTrackedFiles()
+	if err != nil {
+		return "", err
+	}
+
+	if err := r.ensureCleanForCheckout(); err != nil {
+		return "", err
+	}
+	if err := r.ensureIndexMatchesWorkingTree(); err != nil {
+		return "", err
+	}
+
+	paths := map[string]struct{}{}
+	for path := range parentFiles {
+		paths[path] = struct{}{}
+	}
+	for path := range targetFiles {
+		paths[path] = struct{}{}
+	}
+
+	conflictPaths := make([]string, 0)
+	appliedChanges := false
+	for path := range paths {
+		parentHash, parentOK := parentFiles[path]
+		targetHash, targetOK := targetFiles[path]
+		currentHash, currentOK := currentFiles[path]
+
+		if parentOK == targetOK && parentHash == targetHash {
+			continue
+		}
+
+		if currentOK == targetOK && currentHash == targetHash {
+			if parentOK {
+				blobData, err := r.store.ReadObject(parentHash)
+				if err != nil {
+					return "", fmt.Errorf("failed to read blob %s: %v", parentHash, err)
+				}
+				content := objectBody(blobData)
+				osPath := filepath.FromSlash(path)
+				if err := os.MkdirAll(filepath.Dir(osPath), 0755); err != nil {
+					return "", fmt.Errorf("failed to create directory for %s: %v", path, err)
+				}
+				if err := os.WriteFile(osPath, content, 0644); err != nil {
+					return "", fmt.Errorf("failed to write file %s: %v", path, err)
+				}
+				r.index.Add(path, parentHash)
+			} else {
+				_ = os.Remove(filepath.FromSlash(path))
+				r.index.Remove(path)
+			}
+			appliedChanges = true
+			continue
+		}
+
+		if currentOK == parentOK && (!currentOK || currentHash == parentHash) {
+			continue
+		}
+		if !parentOK {
+			conflictPaths = append(conflictPaths, path)
+			continue
+		}
+
+		currentContent := ""
+		if currentOK {
+			currentBlob, err := r.store.ReadObject(currentHash)
+			if err != nil {
+				return "", fmt.Errorf("failed to read blob %s: %v", currentHash, err)
+			}
+			currentContent = string(objectBody(currentBlob))
+		}
+
+		parentBlob, err := r.store.ReadObject(parentHash)
+		if err != nil {
+			return "", fmt.Errorf("failed to read blob %s: %v", parentHash, err)
+		}
+		parentContent := string(objectBody(parentBlob))
+
+		conflictContent := makeRevertConflictMarker(currentContent, parentContent)
+		osPath := filepath.FromSlash(path)
+		if err := os.MkdirAll(filepath.Dir(osPath), 0755); err != nil {
+			return "", fmt.Errorf("failed to create directory for %s: %v", path, err)
+		}
+		if err := os.WriteFile(osPath, []byte(conflictContent), 0644); err != nil {
+			return "", fmt.Errorf("failed to write file %s: %v", path, err)
+		}
+		appliedChanges = true
+		conflictPaths = append(conflictPaths, path)
+	}
+
+	if appliedChanges {
+		r.index.Save()
+	}
+
+	if len(conflictPaths) > 0 {
+		if err := r.writeRevertState(commitHash, conflictPaths); err != nil {
+			return "", err
+		}
+		return "", fmt.Errorf("CONFLICT (modify/delete): %s deleted in revert and modified in HEAD. Version HEAD left in tree.", strings.Join(conflictPaths, ", "))
+	}
+
+	if !appliedChanges {
+		return "", fmt.Errorf("nothing to revert")
+	}
+
+	message := "Revert: " + targetCommit.message
+	if message == "Revert: " {
+		message = "Revert commit"
+	}
+	_ = r.clearRevertState()
+	return r.Commit(message, author, email), nil
+}
+
+func makeRevertConflictMarker(currentContent, parentContent string) string {
+	return fmt.Sprintf("<<<<<<< CURRENT\n%s=======\n%s>>>>>>> REVERT\n", currentContent, parentContent)
+}
+
+func (r *Repository) writeRevertState(commitHash string, conflicts []string) error {
+	if err := os.WriteFile(".loki/REVERT_HEAD", []byte(commitHash+"\n"), 0644); err != nil {
+		return fmt.Errorf("failed to write revert state: %v", err)
+	}
+	if err := os.WriteFile(".loki/REVERT_CONFLICTS", []byte(strings.Join(conflicts, "\n")+"\n"), 0644); err != nil {
+		return fmt.Errorf("failed to write revert state: %v", err)
+	}
+	return nil
+}
+
+func (r *Repository) clearRevertState() error {
+	_ = os.Remove(".loki/REVERT_HEAD")
+	_ = os.Remove(".loki/REVERT_CONFLICTS")
+	return nil
 }
 
 func (r *Repository) Status() []FileStatus {
@@ -447,6 +603,7 @@ func (r *Repository) resolveHeadCommitHash() (string, error) {
 type commitData struct {
 	tree    string
 	parents []string
+	message string
 }
 
 func (r *Repository) readCommitData(commitHash string) (*commitData, error) {
@@ -456,14 +613,19 @@ func (r *Repository) readCommitData(commitHash string) (*commitData, error) {
 	}
 	body := objectBody(objData)
 	data := &commitData{parents: []string{}}
-	for _, line := range bytes.Split(body, []byte("\n")) {
+	parts := bytes.SplitN(body, []byte("\n\n"), 2)
+	for _, line := range bytes.Split(parts[0], []byte("\n")) {
 		if bytes.HasPrefix(line, []byte("tree ")) {
 			data.tree = strings.TrimSpace(string(line[5:]))
 			continue
 		}
 		if bytes.HasPrefix(line, []byte("parent ")) {
 			data.parents = append(data.parents, strings.TrimSpace(string(line[7:])))
+			continue
 		}
+	}
+	if len(parts) == 2 {
+		data.message = strings.TrimSpace(string(parts[1]))
 	}
 	if data.tree == "" {
 		return nil, fmt.Errorf("commit %s has no tree", commitHash)
