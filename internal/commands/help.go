@@ -10,7 +10,8 @@ func Help() {
                       - <files>   Files to add to the staging area
   commit            Record changes to the repository
                       - -m <msg>    Commit message
- 	merge             Merge a branch into the current branch
+  revert            Create a new commit that undoes a past commit
+  merge             Merge a branch into the current branch
   status            Show the working tree status
   log               Show commit logs
   tag               Create, list, or delete tags`)
